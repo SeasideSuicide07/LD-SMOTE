@@ -1,0 +1,306 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
+from sklearn.model_selection import StratifiedKFold
+from imblearn.over_sampling import SMOTE, BorderlineSMOTE, ADASYN
+from imblearn.combine import SMOTEENN, SMOTETomek
+from smote_variants import (
+    G_SMOTE, SMOTE_FRST_2T, SMOTE_OUT, CE_SMOTE, Edge_Det_SMOTE,
+    SDSMOTE, SMOTE_Cosine, SN_SMOTE, Random_SMOTE, Selected_SMOTE
+)
+from sklearn.cluster import KMeans
+from sklearn.metrics import jaccard_score
+
+
+def process_file(file_path):
+    try:
+        data = np.loadtxt(file_path, delimiter=',', dtype=str)
+        data[:, -1] = np.where(data[:, -1] == 'negative', 0, 1)
+
+        X = data[:, :-1].astype(float)
+        y = data[:, -1].astype(int)
+
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        print(f"Processed file {file_path}: {X_scaled.shape[0]} samples, {X_scaled.shape[1]} features")
+        return X_scaled, y
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}")
+        return None, None
+
+
+def calculate_jaccard_scores(X, y):
+    jaccard_scores = []
+    for i in range(X.shape[1]):
+        kmeans = KMeans(n_clusters=2, random_state=0)
+        kmeans.fit(X[:, [i]])
+        labels = kmeans.labels_
+        jaccard1 = jaccard_score(y, labels, average='binary')
+        labels_swapped = 1 - labels
+        jaccard2 = jaccard_score(y, labels_swapped, average='binary')
+        max_jaccard = max(jaccard1, jaccard2)
+        jaccard_scores.append(max_jaccard)
+
+    jaccard_scores = np.array(jaccard_scores)
+    normalized_jc = jaccard_scores / np.sum(jaccard_scores) if np.sum(jaccard_scores) > 0 else jaccard_scores
+    return normalized_jc
+
+
+def custom_distance(sample_a, sample_b, jc_values):
+    return np.mean((sample_a - sample_b) / jc_values)
+
+
+def LD_SMOTE_with_density(X_train, y_train, minority_samples, best_k=None, target_ratio=1.0):
+    jc_values = calculate_jaccard_scores(X_train, y_train)
+    num_samples = len(minority_samples)
+    new_samples = []
+
+    distances = np.zeros((num_samples, num_samples))
+    for i in range(num_samples):
+        for j in range(num_samples):
+            if i != j:
+                distances[i, j] = custom_distance(minority_samples[i], minority_samples[j], jc_values)
+
+    ADs = [np.mean(np.sort(distances[idx])[1:best_k + 1]) for idx in range(num_samples)]
+    ADs = np.array(ADs)
+    ADs_median = np.median(ADs) if np.median(ADs) != 0 else 1
+    weights = np.exp(-0.5 * (ADs / ADs_median) ** 2) / (np.sqrt(2 * np.pi) * ADs_median)
+    sum_weights = np.sum(weights)
+
+    if sum_weights == 0:
+        num_new_samples = np.zeros(num_samples, dtype=int)
+    else:
+        num_new_samples = ((len(X_train) - len(minority_samples) * 2) * (weights / sum_weights)).astype(int)
+        num_new_samples = np.maximum(num_new_samples, 0)
+
+    for idx, sample in enumerate(minority_samples):
+        k_value = best_k if ADs[idx] <= np.mean(ADs) else (best_k + 1 if best_k is not None else 3)
+        neighbors = np.argsort(distances[idx])[1:k_value + 1]
+
+        for i in range(len(neighbors)):
+            for j in range(i + 1, len(neighbors)):
+                for _ in range(num_new_samples[idx]):
+                    alpha = np.random.rand()
+                    beta = np.random.rand()
+                    if alpha + beta <= 1:
+                        point_a = minority_samples[neighbors[i]]
+                        point_b = minority_samples[neighbors[j]]
+                        new_sample = sample + (alpha * (point_a - sample)) + (beta * (point_b - sample))
+                        new_samples.append(new_sample)
+
+    new_samples = np.array(new_samples) if len(new_samples) > 0 else np.empty((0, X_train.shape[1]))
+
+    num_positive = np.sum(y_train == 1)
+    num_negative = np.sum(y_train == 0)
+    target_positive = int(num_negative * target_ratio)
+    num_new_positive = max(0, target_positive - num_positive)
+
+    if len(new_samples) > num_new_positive:
+        new_samples = new_samples[:num_new_positive]
+
+    return new_samples
+
+
+def evaluate_method(X_train, y_train, X_test, y_test, method, method_name):
+    try:
+        if method_name == 'LD_SMOTE_with_density':
+            minority_samples = X_train[y_train == 1]
+            best_k = None
+            best_average_metric = 0
+            best_metrics = (0, 0, 0, 0)
+            num_generated_samples = 0
+            sample_diff = 0
+
+            for k in range(2, 11):
+                new_samples = LD_SMOTE_with_density(X_train, y_train, minority_samples, k, target_ratio=1.0)
+                X_train_extended = np.vstack((X_train, new_samples))
+                y_train_extended = np.concatenate((y_train, [1] * len(new_samples)))
+
+                svm = SVC(probability=True)
+                svm.fit(X_train_extended, y_train_extended)
+
+                y_pred = svm.predict(X_test)
+                y_pred_prob = svm.predict_proba(X_test)[:, 1]
+                accuracy = accuracy_score(y_test, y_pred)
+                f1 = f1_score(y_test, y_pred, average='weighted')
+                g_mean = np.sqrt(accuracy * f1)
+                auc = roc_auc_score(y_test, y_pred_prob)
+
+                average_metric = (accuracy + f1 + g_mean + auc) / 4
+
+                if average_metric > best_average_metric:
+                    best_average_metric = average_metric
+                    best_k = k
+                    best_metrics = (accuracy, f1, g_mean, auc)
+
+            if best_k is None:
+                best_k = 3
+
+            new_samples = LD_SMOTE_with_density(X_train, y_train, minority_samples, best_k, target_ratio=1.0)
+            X_train_extended = np.vstack((X_train, new_samples))
+            y_train_extended = np.concatenate((y_train, [1] * len(new_samples)))
+
+            svm = SVC(probability=True)
+            svm.fit(X_train_extended, y_train_extended)
+
+            y_pred = svm.predict(X_test)
+            y_pred_prob = svm.predict_proba(X_test)[:, 1]
+
+            accuracy = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted')
+            g_mean = np.sqrt(accuracy * f1)
+            auc = roc_auc_score(y_test, y_pred_prob)
+
+            num_generated_samples = len(new_samples)
+            sample_diff = len(X_train_extended) - len(X_train)
+            minority_count_new = np.sum(y_train_extended == 1)
+            minority_count_original = np.sum(y_train == 1)
+
+            return accuracy, f1, g_mean, auc, best_k, num_generated_samples, sample_diff, minority_count_original, minority_count_new
+
+        else:
+            if callable(method):
+                method_instance = method()
+            else:
+                method_instance = method
+
+            X_train_resampled, y_train_resampled = method_instance.fit_resample(X_train, y_train)
+            svm = SVC(probability=True)
+            svm.fit(X_train_resampled, y_train_resampled)
+
+            y_pred = svm.predict(X_test)
+            y_pred_prob = svm.predict_proba(X_test)[:, 1]
+
+            accuracy = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted')
+            g_mean = np.sqrt(accuracy * f1)
+            auc = roc_auc_score(y_test, y_pred_prob)
+
+            return accuracy, f1, g_mean, auc, None, None, None, None, None
+
+    except Exception as e:
+        print(f"Error evaluating method {method_name}: {e}")
+        return 0, 0, 0, 0, None, None, None, None, None
+
+def compute_metrics_for_file(file_path, methods, method_names):
+    X, y = process_file(file_path)
+    if X is None or y is None:
+        return None
+
+    metrics_results = {'dataset': os.path.basename(file_path), 'metrics': {}}
+    skf = StratifiedKFold(n_splits=5)
+
+    for method_name in method_names:
+        metrics = {
+            'accuracy': [],
+            'f1': [],
+            'g_mean': [],
+            'auc': [],
+            'best_k': None
+        }
+
+        for train_index, test_index in skf.split(X, y):
+            X_train, X_test = X[train_index], X[test_index]
+            y_train, y_test = y[train_index], y[test_index]
+
+            if method_name == 'LD_SMOTE_with_density':
+                accuracy, f1, g_mean, auc, best_k, num_generated_samples, sample_diff, minority_count_original, minority_count_new = evaluate_method(
+                    X_train, y_train, X_test, y_test, None, method_name
+                )
+                metrics['accuracy'].append(accuracy)
+                metrics['f1'].append(f1)
+                metrics['g_mean'].append(g_mean)
+                metrics['auc'].append(auc)
+                metrics['best_k'] = best_k
+
+            else:
+                accuracy, f1, g_mean, auc, _, _, _, _, _ = evaluate_method(
+                    X_train, y_train, X_test, y_test, methods[method_name], method_name
+                )
+                metrics['accuracy'].append(accuracy)
+                metrics['f1'].append(f1)
+                metrics['g_mean'].append(g_mean)
+                metrics['auc'].append(auc)
+
+
+        metrics_results['metrics'][method_name] = {
+            'accuracy': np.mean(metrics['accuracy']),
+            'f1': np.mean(metrics['f1']),
+            'g_mean': np.mean(metrics['g_mean']),
+            'auc': np.mean(metrics['auc']),
+            'best_k': metrics['best_k']
+        }
+
+    return metrics_results
+
+
+def save_results_to_excel(results, output_file):
+    df_list = []
+    for result in results:
+        dataset_name = result['dataset']
+        metrics = result['metrics']
+
+        for method_name, metrics_data in metrics.items():
+            row = {
+                'dataset': dataset_name,
+                'size': metrics_data.get('size', np.nan),
+                'dimensionality': metrics_data.get('dimensionality', np.nan),
+                'IR': metrics_data.get('IR', np.nan),
+                'method': method_name,
+                'accuracy': metrics_data['accuracy'],
+                'f1': metrics_data['f1'],
+                'g_mean': metrics_data['g_mean'],
+                'auc': metrics_data['auc'],
+            }
+            if method_name == 'LD_SMOTE_with_density':
+                row['best_k'] = metrics_data['best_k']
+            else:
+                row['best_k'] = np.nan
+
+            df_list.append(row)
+
+    all_results_df = pd.DataFrame(df_list)
+    all_results_df.to_excel(output_file, index=False)
+
+def main():
+    folder_path = '/Users/wangyueming/Desktop/Amphibians1'
+    file_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.csv')]
+    output_file = '/Users/wangyueming/Desktop/Amphibians1/result111.xlsx'
+    
+    methods = {
+        'SMOTE': SMOTE,
+        'BorderlineSMOTE': BorderlineSMOTE,
+        'ADASYN': ADASYN,
+        'SMOTEENN': SMOTEENN,
+        'SMOTETomek': SMOTETomek,
+        'G_SMOTE': G_SMOTE,
+        'SMOTE_FRST_2T': SMOTE_FRST_2T,
+        'SMOTE_OUT': SMOTE_OUT,
+        'CE_SMOTE': CE_SMOTE,
+        'Edge_Det_SMOTE': Edge_Det_SMOTE,
+        'SDSMOTE': SDSMOTE,
+        'SMOTE_Cosine': SMOTE_Cosine,
+        'SN_SMOTE': SN_SMOTE,
+        'Random_SMOTE': Random_SMOTE,
+        'Selected_SMOTE': Selected_SMOTE,
+        'LD_SMOTE_with_density': None
+    }
+    method_names = list(methods.keys())
+
+    all_metrics_results = []
+    for file_path in file_paths:
+        print(f"Processing dataset: {file_path}")
+        metrics_results = compute_metrics_for_file(file_path, methods, method_names)
+        if metrics_results:
+            all_metrics_results.append(metrics_results)
+
+    save_results_to_excel(all_metrics_results, output_file)
+    print(f"Results saved to {output_file}")
+
+
+if __name__ == "__main__":
+    main()
